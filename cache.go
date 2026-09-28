@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -322,20 +325,29 @@ func (c *cache) GetIcon(id string) (i []Icon) {
 			if bestScore == -1 || currentScore < bestScore || (currentScore == bestScore && iconData.Width > bestIcon.Width) {
 				bestScore = currentScore
 
-				uri := iconData.URI
-				if uri[0:7] != "http://" && uri[0:8] != "https://" {
-					uri = fmt.Sprintf("https://json.schedulesdirect.org/20141201/image/%s?token=%s", uri, Token)
-				}
-
-				bestIcon = &Icon{Src: uri, Height: iconData.Height, Width: iconData.Width}
+				bestIcon = &Icon{Src: iconData.URI, Height: iconData.Height, Width: iconData.Width}
 			}
 		}
 
 		if bestIcon != nil {
 			if Config.Options.Images.Download {
-				downloadImage(bestIcon.Src, id)
+				// Serve the image from the local image server. The token never
+				// ends up in the XMLTV file.
+				filename, err := downloadImage(bestIcon.Src)
+				if err != nil {
+					if Config.Options.SDDownloadErrors {
+						logger.Warn("Could not download image", "programID", id, "error", err)
+					}
+				} else {
+					bestIcon.Src = "http://" + Config.Server.Address + ":" + Config.Server.Port + "/" + filename
+					i = append(i, *bestIcon)
+				}
+			} else if isAbsoluteURL(bestIcon.Src) {
+				// Relative SD image URIs need a token, which must not be
+				// written to the XMLTV file. Only absolute URLs are usable
+				// without downloading.
+				i = append(i, *bestIcon)
 			}
-			i = append(i, *bestIcon)
 		}
 	}
 	return
@@ -715,7 +727,48 @@ func (c *cache) GetRating(id, countryCode string) (ra []Rating) {
 	return
 }
 
-func downloadImage(imageURL, programID string) (string, error) {
+// imageDownloadsStopped is set when Schedules Direct tells us to stop
+// requesting images (daily limit reached, token or account problem).
+// Every further request would count against the account, so no more image
+// requests are sent for the rest of the run.
+var imageDownloadsStopped bool
+
+const sdImageURL = "https://json.schedulesdirect.org/20141201/image/"
+
+func isAbsoluteURL(uri string) bool {
+	return strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://")
+}
+
+// imageFilename returns the local file name for an image URI. SD image URIs
+// are content hashes, so programs sharing an image (e.g. all episodes of a
+// series) share one file and it is only downloaded once.
+func imageFilename(uri string) string {
+	if u, err := url.Parse(uri); err == nil {
+		uri = u.Path
+	}
+	return path.Base(uri)
+}
+
+// sdImageStopCodes are Schedules Direct error codes after which image
+// downloads must stop for the current run.
+var sdImageStopCodes = map[int]bool{
+	1004: true, // TOKEN_MISSING
+	4001: true, // ACCOUNT_EXPIRED
+	4003: true, // INVALID_USER
+	4004: true, // ACCOUNT_LOCKOUT
+	4005: true, // JSON_ACCOUNT_ACCESS_DISABLED
+	4006: true, // TOKEN_EXPIRED
+	4007: true, // APPLICATION_DISABLED
+	4008: true, // ACCOUNT_INACTIVE
+	4009: true, // TOO_MANY_LOGINS
+	4010: true, // TOO_MANY_UNIQUE_IPS
+	5002: true, // MAX_IMAGE_DOWNLOADS
+	5003: true, // MAX_IMAGE_DOWNLOADS_TRIAL
+}
+
+// downloadImage downloads an image into the image folder and returns the
+// file name. Existing files are not downloaded again.
+func downloadImage(uri string) (string, error) {
 
 	folderImage := Config.Options.Images.Path
 
@@ -731,32 +784,89 @@ func downloadImage(imageURL, programID string) (string, error) {
 		}
 	}
 
-	// Extract filename from URL
-	filename := programID + ".jpg"
+	filename := imageFilename(uri)
+	if filename == "" || filename == "." || filename == "/" {
+		return "", fmt.Errorf("invalid image uri: %q", uri)
+	}
 	filePath := filepath.Join(folderImage, filename)
 	if _, err := os.Stat(filePath); err == nil {
-		return filePath, nil
+		return filename, nil
 	}
 
-	resp, err := http.Get(imageURL)
-	if err != nil {
-		return "", fmt.Errorf("failed to download image: %w", err)
+	if imageDownloadsStopped {
+		return "", fmt.Errorf("image downloads stopped for this run")
 	}
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("failed to download image: %s", resp.Status)
+
+	imageURL := uri
+	if !isAbsoluteURL(uri) {
+		// The token goes into the query string rather than a header, so it is
+		// not forwarded when SD redirects to the storage bucket.
+		imageURL = sdImageURL + uri + "?token=" + url.QueryEscape(Token)
+	}
+
+	req, err := http.NewRequest("GET", imageURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create image request for %s: %w", filename, err)
+	}
+	req.Header.Set("User-Agent", AppName)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to download image %s: %w", filename, redactToken(err))
 	}
 	defer resp.Body.Close()
 
-	out, err := os.Create(filePath)
+	// SD reports errors (including the daily image limit) as JSON, sometimes
+	// with HTTP 200. Only save responses that are actually images.
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "image/") {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		var sdErr struct {
+			Code     int    `json:"code"`
+			Response string `json:"response"`
+			Message  string `json:"message"`
+		}
+		if json.Unmarshal(body, &sdErr) == nil && sdErr.Code != 0 {
+			if sdImageStopCodes[sdErr.Code] {
+				imageDownloadsStopped = true
+				logger.Warn("Schedules Direct returned an error, no more images will be requested in this run",
+					"code", sdErr.Code, "response", sdErr.Response, "message", sdErr.Message)
+			}
+			return "", fmt.Errorf("schedules direct error %d (%s) for image %s", sdErr.Code, sdErr.Response, filename)
+		}
+		return "", fmt.Errorf("unexpected response for image %s: %s, content type %q", filename, resp.Status, resp.Header.Get("Content-Type"))
+	}
+
+	// Write to a temporary file first so an interrupted download never
+	// leaves a truncated image that would be served forever.
+	tmp, err := os.CreateTemp(folderImage, filename+".*.tmp")
 	if err != nil {
 		return "", fmt.Errorf("failed to create file: %w", err)
 	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
+	_, err = io.Copy(tmp, resp.Body)
+	closeErr := tmp.Close()
+	if err == nil {
+		err = closeErr
+	}
 	if err != nil {
-		return "", fmt.Errorf("failed to save image: %w", err)
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("failed to save image %s: %w", filename, err)
+	}
+	if err = os.Chmod(tmp.Name(), 0644); err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("failed to save image %s: %w", filename, err)
+	}
+	if err = os.Rename(tmp.Name(), filePath); err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("failed to save image %s: %w", filename, err)
 	}
 
-	return filePath, nil
+	return filename, nil
+}
+
+// redactToken removes the SD token from errors that contain the request URL.
+func redactToken(err error) error {
+	if Token == "" {
+		return err
+	}
+	return fmt.Errorf("%s", strings.ReplaceAll(err.Error(), Token, "REDACTED"))
 }

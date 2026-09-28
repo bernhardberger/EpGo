@@ -177,11 +177,7 @@ func getProgram(channel EPGoCache) (p []Programme) {
 			var imageURL string
 			icons := Cache.GetIcon(s.ProgramID)
 			if len(icons) != 0 {
-				if Config.Options.Images.Download {
-					imageURL = "http://" + Config.Server.Address + ":" + Config.Server.Port + "/" + s.ProgramID + ".jpg"
-				} else {
-					imageURL = icons[0].Src
-				}
+				imageURL = icons[0].Src
 			}
 
 			if imageURL == "" && Config.Options.Images.Tmdb.Enable {
