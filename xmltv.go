@@ -186,10 +186,8 @@ func getProgram(channel EPGoCache) (p []Programme) {
 					logger.Error("could not connect to tmdb. check your api key", "error", err)
 				}
 			}
-			pro.Icon = []Icon{
-				{
-					Src: imageURL,
-				},
+			if imageURL != "" {
+				pro.Icon = []Icon{{Src: imageURL}}
 			}
 
 			// Rating
