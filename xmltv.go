@@ -189,6 +189,7 @@ func getProgram(channel EPGoCache) (p []Programme) {
 			if imageURL != "" {
 				pro.Icon = []Icon{{Src: imageURL}}
 			}
+			pro.Images = Cache.GetImages(s.ProgramID)
 
 			// Rating
 			pro.Rating = Cache.GetRating(s.ProgramID, countryCode)
