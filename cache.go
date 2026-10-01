@@ -744,6 +744,13 @@ func isAbsoluteURL(uri string) bool {
 // imageFilename returns the local file name for an image URI. SD image URIs
 // are content hashes, so programs sharing an image (e.g. all episodes of a
 // series) share one file and it is only downloaded once.
+func imageFolder() string {
+	if Config.Options.Images.Path == "" {
+		return "images"
+	}
+	return Config.Options.Images.Path
+}
+
 func imageFilename(uri string) string {
 	if u, err := url.Parse(uri); err == nil {
 		uri = u.Path
@@ -787,11 +794,7 @@ func downloadImage(uri string) (string, error) {
 // downloadImage can remember the failure.
 func fetchImage(uri string) (string, error) {
 
-	folderImage := Config.Options.Images.Path
-
-	if Config.Options.Images.Path == "" {
-		folderImage = "images"
-	}
+	folderImage := imageFolder()
 
 	// Create the "images" folder if it doesn't exist
 	if _, err := os.Stat(folderImage); os.IsNotExist(err) {
