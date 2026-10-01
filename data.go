@@ -99,6 +99,10 @@ func (sd *SD) GetData() {
 	// Channel list
 	Cache.Channel = make(map[string]EPGoCache)
 
+	// Schedules are downloaded fresh every run. A run interrupted before
+	// CleanUp leaves them in the cache, and appending would duplicate them.
+	Cache.Schedule = make(map[string][]EPGoCache)
+
 	var lineup []string
 
 	for _, l := range sd.Resp.Status.Lineups {
